@@ -1,6 +1,5 @@
 # ida_export_for_ai.py
 # IDA Plugin to export decompiled functions, strings, memory, imports and exports for AI analysis
-# Compatible with IDA 9.0+
 
 import os
 import sys
@@ -16,26 +15,13 @@ import idc
 import ida_auto
 import ida_kernwin
 import ida_idaapi
+import ida_undo
+import ida_idp
 import ida_ida
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import multiprocessing as mp
-
-# Conditionally import modules that may not exist in IDA 9.0
-try:
-    import ida_undo
-
-    HAS_IDA_UNDO = True
-except ImportError:
-    HAS_IDA_UNDO = False
-
-try:
-    import ida_idp
-
-    HAS_IDA_IDP = True
-except ImportError:
-    HAS_IDA_IDP = False
 
 WORKER_COUNT = max(1, mp.cpu_count() - 1)
 TASK_BATCH_SIZE = 50
@@ -50,11 +36,8 @@ def get_idb_directory():
     """获取 IDB 文件所在目录"""
     idb_path = ida_nalt.get_input_file_path()
     if not idb_path:
-        try:
-            import ida_loader
-            idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
-        except:
-            pass
+        import ida_loader
+        idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
     return os.path.dirname(idb_path) if idb_path else os.getcwd()
 
 
@@ -67,18 +50,16 @@ def ensure_dir(path):
 def clear_undo_buffer():
     """清理 IDA 撤销缓冲区，防止内存溢出"""
     try:
-        if HAS_IDA_UNDO:
-            ida_undo.clear_undo_buffer()
+        ida_undo.clear_undo_buffer()
         gc.collect()
     except:
         pass
 
 
 def disable_undo():
-    """禁用撤销功能"""
+    """禁用撤销功能（IDA 7.0+）"""
     try:
-        if HAS_IDA_IDP and hasattr(ida_idp, 'disable_undo'):
-            ida_idp.disable_undo(True)
+        ida_idp.disable_undo(True)
     except:
         pass
 
@@ -86,8 +67,7 @@ def disable_undo():
 def enable_undo():
     """启用撤销功能"""
     try:
-        if HAS_IDA_IDP and hasattr(ida_idp, 'disable_undo'):
-            ida_idp.disable_undo(False)
+        ida_idp.disable_undo(False)
     except:
         pass
 
@@ -257,10 +237,11 @@ def export_decompiled_functions(export_dir, skip_existing=True):
 
     def aggressive_memory_cleanup():
         """激进的内存清理"""
-        # 清理IDA Hex-Rays内部缓存
+        # 强制删除大对象引用
+        import sys
+        # 清理IDA内部缓存
         try:
-            if hasattr(ida_hexrays, 'clear_cached_cfuncs'):
-                ida_hexrays.clear_cached_cfuncs()
+            ida_hexrays.clear_cached_cfuncs()
         except:
             pass
         # 强制垃圾回收
@@ -692,6 +673,310 @@ def export_memory(export_dir):
     print("    Files created: {}".format(file_count))
 
 
+def _ptr_export_get_ptr_size():
+    """获取当前数据库的指针大小"""
+    return 8 if ida_ida.inf_is_64bit() else 4
+
+
+def _ptr_export_read_pointer(ea, ptr_size):
+    """读取指针值"""
+    return ida_bytes.get_qword(ea) if ptr_size == 8 else ida_bytes.get_dword(ea)
+
+
+def _ptr_export_get_segment_name(ea):
+    """获取地址所在段名"""
+    seg = ida_segment.getseg(ea)
+    if not seg:
+        return "unknown"
+    name = ida_segment.get_segm_name(seg)
+    return name if name else "unknown"
+
+
+def _ptr_export_is_valid_target(target_ea):
+    """判断目标地址是否落在有效段内"""
+    if target_ea in (0, ida_idaapi.BADADDR):
+        return False
+    return ida_segment.getseg(target_ea) is not None
+
+
+def _ptr_export_safe_text(value):
+    """将文本压成单行，便于写入导出文件"""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", errors="replace")
+        except Exception:
+            value = repr(value)
+    else:
+        value = str(value)
+
+    value = value.replace("\r", " ").replace("\n", " ").replace("|", "/").strip()
+    if len(value) > 80:
+        value = value[:77] + "..."
+    return value
+
+
+def _ptr_export_get_target_name(target_ea):
+    """获取目标符号名"""
+    name = idc.get_name(target_ea, idc.GN_VISIBLE)
+    if not name:
+        func = ida_funcs.get_func(target_ea)
+        if func:
+            name = idc.get_func_name(func.start_ea)
+    if not name:
+        name = "unknown"
+    return _ptr_export_safe_text(name)
+
+
+def _ptr_export_try_get_string_preview(target_ea):
+    """尝试提取字符串预览"""
+    try:
+        flags = ida_bytes.get_full_flags(target_ea)
+        if not ida_bytes.is_strlit(flags):
+            return ""
+    except Exception:
+        return ""
+
+    try:
+        strtype = idc.get_str_type(target_ea)
+    except Exception:
+        strtype = -1
+
+    try:
+        raw = ida_bytes.get_strlit_contents(target_ea, -1, strtype)
+    except Exception:
+        raw = None
+
+    preview = _ptr_export_safe_text(raw)
+    if preview:
+        return '"{}"'.format(preview)
+    return "string_literal"
+
+
+def _ptr_export_is_import_target(target_ea, target_name):
+    """启发式判断是否为导入项/IAT"""
+    seg_name = _ptr_export_get_segment_name(target_ea).lower()
+    name_l = (target_name or "").lower()
+
+    if name_l.startswith("__imp_") or name_l.startswith("imp_"):
+        return True
+
+    import_like_segments = {
+        "extern", ".idata", "idata", ".idata$2", ".idata$4", ".idata$5", ".idata$6",
+        ".got", "got", ".got.plt", "got.plt", "__la_symbol_ptr", "__nl_symbol_ptr"
+    }
+    return seg_name in import_like_segments
+
+
+def _ptr_export_classify_target(target_ea):
+    """返回 (target_name, target_type, target_detail)"""
+    target_name = _ptr_export_get_target_name(target_ea)
+
+    try:
+        flags = ida_bytes.get_full_flags(target_ea)
+    except Exception:
+        flags = 0
+
+    if _ptr_export_is_import_target(target_ea, target_name):
+        return target_name, "import_pointer", "import_entry"
+
+    try:
+        if ida_bytes.is_strlit(flags):
+            return target_name, "string_pointer", _ptr_export_try_get_string_preview(target_ea)
+    except Exception:
+        pass
+
+    try:
+        func = ida_funcs.get_func(target_ea)
+    except Exception:
+        func = None
+
+    if func:
+        if func.start_ea == target_ea:
+            return target_name, "function_pointer", "function_start"
+        func_name = _ptr_export_get_target_name(func.start_ea)
+        return target_name, "code_pointer", "inside_{}".format(func_name)
+
+    try:
+        if ida_bytes.is_code(flags):
+            return target_name, "code_pointer", "instruction"
+    except Exception:
+        pass
+
+    try:
+        if ida_bytes.is_struct(flags):
+            return target_name, "struct_pointer", "struct_data"
+    except Exception:
+        pass
+
+    try:
+        if ida_bytes.is_data(flags):
+            return target_name, "data_pointer", "data_item_size={}".format(ida_bytes.get_item_size(target_ea))
+    except Exception:
+        pass
+
+    return target_name, "unknown_pointer", ""
+
+
+def _ptr_export_add_record(records, seen, source_ea, target_ea):
+    """去重后加入一条记录"""
+    key = (source_ea, target_ea)
+    if key in seen:
+        return
+    seen.add(key)
+
+    target_name, target_type, target_detail = _ptr_export_classify_target(target_ea)
+    records.append({
+        "source_addr": source_ea,
+        "source_seg": _ptr_export_get_segment_name(source_ea),
+        "points_to": target_ea,
+        "target_name": target_name,
+        "target_type": target_type,
+        "target_detail": target_detail,
+    })
+
+
+def _ptr_export_collect_data_xrefs(records, seen):
+    """收集所有代码头/数据头上的 data xref"""
+    total = 0
+
+    for seg_idx in range(ida_segment.get_segm_qty()):
+        seg = ida_segment.getnseg(seg_idx)
+        if not seg:
+            continue
+
+        for head in idautils.Heads(seg.start_ea, seg.end_ea):
+            try:
+                flags = ida_bytes.get_full_flags(head)
+            except Exception:
+                continue
+
+            if not ida_bytes.is_head(flags):
+                continue
+            if not (ida_bytes.is_code(flags) or ida_bytes.is_data(flags)):
+                continue
+
+            try:
+                target = ida_xref.get_first_dref_from(head)
+            except Exception:
+                target = ida_idaapi.BADADDR
+
+            while target != ida_idaapi.BADADDR:
+                if _ptr_export_is_valid_target(target):
+                    _ptr_export_add_record(records, seen, head, target)
+                    total += 1
+                try:
+                    target = ida_xref.get_next_dref_from(head, target)
+                except Exception:
+                    break
+
+    return total
+
+
+def _ptr_export_collect_raw_pointers(records, seen, ptr_size):
+    """扫描常见数据段中的裸指针，补齐未建立 xref 的项"""
+    total = 0
+
+    for seg_ea in idautils.Segments():
+        seg_name = idc.get_segm_name(seg_ea)
+        seg_start = idc.get_segm_start(seg_ea)
+        seg_end = idc.get_segm_end(seg_ea)
+
+        if not seg_name or not (
+                seg_name.startswith(".data") or seg_name.startswith(".rdata") or seg_name.startswith("data")):
+            continue
+
+        print("[*] Scanning segment: {} ({:X} - {:X})".format(seg_name, seg_start, seg_end))
+
+        for head in idautils.Heads(seg_start, seg_end):
+            try:
+                flags = ida_bytes.get_full_flags(head)
+            except Exception:
+                continue
+
+            if not ida_bytes.is_head(flags):
+                continue
+            if not ida_bytes.is_data(flags):
+                continue
+
+            try:
+                item_size = ida_bytes.get_item_size(head)
+            except Exception:
+                item_size = 0
+
+            if item_size < ptr_size:
+                continue
+
+            slot_count = item_size // ptr_size
+            if slot_count <= 0:
+                continue
+
+            for i in range(slot_count):
+                slot_ea = head + i * ptr_size
+                try:
+                    target = _ptr_export_read_pointer(slot_ea, ptr_size)
+                except Exception:
+                    continue
+
+                if _ptr_export_is_valid_target(target):
+                    _ptr_export_add_record(records, seen, slot_ea, target)
+                    total += 1
+
+    return total
+
+
+def export_pointers(export_dir):
+    """导出指针引用，保留原有导出目录模式"""
+    output_path = os.path.join(export_dir, "pointers.txt")
+    ptr_size = _ptr_export_get_ptr_size()
+    records = []
+    seen = set()
+
+    print("[*] Starting pointer scan. Pointer size: {} bytes".format(ptr_size))
+
+    dref_hits = _ptr_export_collect_data_xrefs(records, seen)
+    raw_hits = _ptr_export_collect_raw_pointers(records, seen, ptr_size)
+
+    records.sort(key=lambda item: (
+        item["source_addr"],
+        item["points_to"],
+        item["source_seg"],
+        item["target_name"],
+        item["target_type"],
+        item["target_detail"],
+    ))
+
+    if records:
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write("# Total Pointers Found: {}\n".format(len(records)))
+                f.write(
+                    "# Format: Source_Address | Segment | Points_To_Address | Target_Name | Target_Type | Target_Detail\n")
+                f.write("# Pointer size: {}\n".format(ptr_size))
+                f.write("# Data xref hits: {}\n".format(dref_hits))
+                f.write("# Raw pointer hits: {}\n".format(raw_hits))
+                f.write("-" * 120 + "\n")
+                for p in records:
+                    f.write("{:X} | {} | {:X} | {} | {} | {}\n".format(
+                        p["source_addr"],
+                        p["source_seg"],
+                        p["points_to"],
+                        p["target_name"],
+                        p["target_type"],
+                        p["target_detail"]
+                    ))
+            print("[+] Pointers exported to: {}".format(output_path))
+            print("[*] Pointers Summary:")
+            print("    Data xref hits: {}".format(dref_hits))
+            print("    Raw pointer hits: {}".format(raw_hits))
+            print("    Unique pointer references exported: {}".format(len(records)))
+        except Exception as e:
+            print("[!] Failed to write pointers: {}".format(str(e)))
+    else:
+        print("[*] No pointers found or no data segments scanned.")
+
+
 def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_count=None):
     """执行导出操作
 
@@ -786,10 +1071,18 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     clear_undo_buffer()
     print("")
 
+    # [新增] 导出指针引用
+    print("[*] Exporting pointers...")
+    export_pointers(export_dir)
+    clear_undo_buffer()
+    print("")
+
     print("[*] Exporting memory...")
     export_memory(export_dir)
     clear_undo_buffer()
     print("")
+
+
 
     if has_hexrays:
         print("[*] Exporting decompiled functions...")
@@ -864,595 +1157,22 @@ def PLUGIN_ENTRY():
 # Standalone Script Support
 # ============================================================================
 
-
-# ============================================================================
-# Pointer Export Extension (additive only, IDA 9.0+ / 9.1 compatible)
-# ============================================================================
-
-try:
-    import ida_name
-
-    HAS_IDA_NAME = True
-except ImportError:
-    HAS_IDA_NAME = False
-
-
-def _ptr_export_get_ptr_size():
-    """获取当前数据库的指针宽度"""
-    return 8 if ida_ida.inf_is_64bit() else 4
-
-
-def _ptr_export_get_segment_name(ea):
-    """获取地址所在段名"""
-    seg = ida_segment.getseg(ea)
-    if seg is None:
-        return "UNKNOWN"
-    try:
-        return ida_segment.get_segm_name(seg)
-    except Exception:
-        return "UNKNOWN"
-
-
-def _ptr_export_read_pointer(ea, ptr_size):
-    """按当前位宽读取指针值"""
-    if ptr_size == 8:
-        return ida_bytes.get_qword(ea)
-    return ida_bytes.get_dword(ea)
-
-
-def _ptr_export_is_valid_target(target_ea):
-    """判断是否为有效的数据库内目标地址"""
-    if target_ea is None:
-        return False
-    if target_ea == ida_idaapi.BADADDR:
-        return False
-    if target_ea == 0:
-        return False
-    seg = ida_segment.getseg(target_ea)
-    if seg is None:
-        return False
-    try:
-        return ida_bytes.is_loaded(target_ea)
-    except Exception:
-        return True
-
-
-def _ptr_export_get_target_name(target_ea):
-    """获取目标地址名称"""
-    name = ""
-    try:
-        if HAS_IDA_NAME:
-            name = ida_name.get_ea_name(target_ea)
-    except Exception:
-        name = ""
-
-    if not name:
-        try:
-            name = idc.get_name(target_ea)
-        except Exception:
-            name = ""
-
-    if not name:
-        try:
-            name = idc.get_func_name(target_ea)
-        except Exception:
-            name = ""
-
-    if not name:
-        name = "sub_{:X}".format(target_ea)
-
-    return name
-
-
-def _ptr_export_add_record(records, seen, source_ea, target_ea):
-    """去重后添加一条导出记录"""
-    key = (source_ea, target_ea)
-    if key in seen:
-        return
-    seen.add(key)
-    records.append((
-        source_ea,
-        _ptr_export_get_segment_name(source_ea),
-        target_ea,
-        _ptr_export_get_target_name(target_ea),
-    ))
-
-
-def _ptr_export_collect_from_data_xrefs(records, seen):
-    """从已建立的数据交叉引用中收集指针引用"""
-    total = 0
-    for seg_idx in range(ida_segment.get_segm_qty()):
-        seg = ida_segment.getnseg(seg_idx)
-        if seg is None:
-            continue
-
-        for head in idautils.Heads(seg.start_ea, seg.end_ea):
-            flags = ida_bytes.get_full_flags(head)
-            if not ida_bytes.is_head(flags):
-                continue
-            if not ida_bytes.is_data(flags):
-                continue
-
-            try:
-                target = ida_xref.get_first_dref_from(head)
-            except Exception:
-                target = ida_idaapi.BADADDR
-
-            while target != ida_idaapi.BADADDR:
-                if _ptr_export_is_valid_target(target):
-                    _ptr_export_add_record(records, seen, head, target)
-                    total += 1
-                try:
-                    target = ida_xref.get_next_dref_from(head, target)
-                except Exception:
-                    break
-
-    return total
-
-
-def _ptr_export_collect_by_raw_scan(records, seen, ptr_size):
-    """通过扫描已定义数据项补齐未建立显式xref的指针槽位"""
-    total = 0
-    for seg_idx in range(ida_segment.get_segm_qty()):
-        seg = ida_segment.getnseg(seg_idx)
-        if seg is None:
-            continue
-
-        for head in idautils.Heads(seg.start_ea, seg.end_ea):
-            flags = ida_bytes.get_full_flags(head)
-            if not ida_bytes.is_head(flags):
-                continue
-            if not ida_bytes.is_data(flags):
-                continue
-
-            item_size = ida_bytes.get_item_size(head)
-            if item_size < ptr_size:
-                continue
-
-            full_slots = item_size // ptr_size
-            if full_slots <= 0:
-                continue
-
-            for slot_index in range(full_slots):
-                slot_ea = head + slot_index * ptr_size
-                try:
-                    target = _ptr_export_read_pointer(slot_ea, ptr_size)
-                except Exception:
-                    continue
-
-                if _ptr_export_is_valid_target(target):
-                    _ptr_export_add_record(records, seen, slot_ea, target)
-                    total += 1
-
-    return total
-
-
-def export_pointers(export_dir):
-    """导出所有指针引用到 pointers.txt"""
-    pointers_path = os.path.join(export_dir, "pointers.txt")
-    ptr_size = _ptr_export_get_ptr_size()
-    records = []
-    seen = set()
-
-    xref_hits = _ptr_export_collect_from_data_xrefs(records, seen)
-    raw_hits = _ptr_export_collect_by_raw_scan(records, seen, ptr_size)
-
-    records.sort(key=lambda item: (item[0], item[2], item[1], item[3]))
-
-    with open(pointers_path, 'w', encoding='utf-8') as f:
-        f.write("# Pointers exported from IDA\n")
-        f.write("# Format: Source_Address | Segment | Points_To_Address | Target_Name\n")
-        f.write("# Pointer size: {}\n".format(ptr_size))
-        f.write("#" + "=" * 80 + "\n\n")
-        for source_ea, seg_name, target_ea, target_name in records:
-            f.write("{} | {} | {} | {}\n".format(
-                hex(source_ea),
-                seg_name,
-                hex(target_ea),
-                target_name
-            ))
-
-    print("[*] Pointers Summary:")
-    print("    Pointer size: {}".format(ptr_size))
-    print("    Data xref hits: {}".format(xref_hits))
-    print("    Raw scan hits: {}".format(raw_hits))
-    print("    Unique pointer references exported: {}".format(len(records)))
-
-
-_original_do_export = do_export
-
-
-def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_count=None):
-    """执行导出操作（追加 pointers.txt 导出）"""
-    global WORKER_COUNT
-
-    if worker_count is not None:
-        WORKER_COUNT = max(1, worker_count)
-
-    print("=" * 60)
-    print("IDA Export for AI Analysis")
-    print("=" * 60)
-    print("[*] Using {} worker threads for parallel I/O".format(WORKER_COUNT))
-
-    clear_undo_buffer()
-    disable_undo()
-
-    if not ida_hexrays.init_hexrays_plugin():
-        print("[!] Hex-Rays decompiler is not available!")
-        print("[!] Strings will still be exported, but no decompilation.")
-        has_hexrays = False
-    else:
-        has_hexrays = True
-        print("[+] Hex-Rays decompiler initialized")
-
-    if not skip_auto_analysis:
-        print("[*] Waiting for auto-analysis to complete...")
-        print("[*] Tip: This may take a while for large files. Press Ctrl+Break to cancel.")
-        clear_undo_buffer()
-        ida_auto.auto_wait()
-        clear_undo_buffer()
-    else:
-        print("[*] Skipping auto-analysis wait (assuming already complete)")
-
-    if export_dir is None:
-        idb_dir = get_idb_directory()
-        default_export_dir = os.path.join(idb_dir, "export-for-ai")
-
-        if ask_user:
-            choice = ida_kernwin.ask_yn(ida_kernwin.ASKBTN_YES,
-                                        "Export to default directory?\n\n{}\n\nYes: Use default directory\nNo: Choose custom directory\nCancel: Abort export".format(
-                                            default_export_dir))
-
-            if choice == ida_kernwin.ASKBTN_CANCEL:
-                print("[*] Export cancelled by user")
-                enable_undo()
-                return
-            elif choice == ida_kernwin.ASKBTN_NO:
-                selected_dir = ida_kernwin.ask_str(default_export_dir, 0, "Enter export directory path:")
-                if selected_dir:
-                    export_dir = selected_dir
-                    print("[*] Using custom directory: {}".format(export_dir))
-                else:
-                    print("[*] Export cancelled by user")
-                    enable_undo()
-                    return
-            else:
-                export_dir = default_export_dir
-        else:
-            export_dir = default_export_dir
-
-    ensure_dir(export_dir)
-
-    print("[+] Export directory: {}".format(export_dir))
-    print("")
-
-    print("[*] Exporting strings...")
-    export_strings(export_dir)
-    clear_undo_buffer()
-    print("")
-
-    print("[*] Exporting imports...")
-    export_imports(export_dir)
-    clear_undo_buffer()
-    print("")
-
-    print("[*] Exporting exports...")
-    export_exports(export_dir)
-    clear_undo_buffer()
-    print("")
-
-    print("[*] Exporting memory...")
-    export_memory(export_dir)
-    clear_undo_buffer()
-    print("")
-
-    print("[*] Exporting pointers...")
-    export_pointers(export_dir)
-    clear_undo_buffer()
-    print("")
-
-    if has_hexrays:
-        print("[*] Exporting decompiled functions...")
-        print("[*] Tip: If IDA crashes, you can restart and the export will resume from where it left off")
-        export_decompiled_functions(export_dir, skip_existing=True)
-
-    enable_undo()
-
-    print("")
-    print("=" * 60)
-    print("[+] Export completed!")
-    print("    Output directory: {}".format(export_dir))
-    print("=" * 60)
-
-    ida_kernwin.info("Export completed!\n\nOutput directory:\n{}".format(export_dir))
-
-
 if __name__ == "__main__":
     # 支持作为独立脚本运行（用于批处理模式）
-    # IDA 9.0 兼容的参数获取方式
-    export_dir = None
-    skip_analysis = False
-
-    try:
-        # 优先使用 idc.ARGV（IDA 9.0+ 推荐方式）
-        if hasattr(idc, 'ARGV') and idc.ARGV is not None and len(idc.ARGV) > 1:
-            export_dir = idc.ARGV[1]
-            if len(idc.ARGV) > 2:
-                skip_analysis = (idc.ARGV[2] == "1")
-        else:
-            # 回退到 eval_idc 方式（旧版 IDA 兼容）
-            argc = int(idc.eval_idc("ARGV.count"))
-            if argc >= 2:
-                export_dir = idc.eval_idc("ARGV[1]")
-            if argc >= 3:
-                skip_analysis = (idc.eval_idc("ARGV[2]") == "1")
-    except:
-        # 如果参数获取失败，使用默认值
-        pass
+    argc = int(idc.eval_idc("ARGV.count"))
+    if argc < 2:
+        export_dir = None
+        skip_analysis = False
+    elif argc < 3:
+        export_dir = idc.eval_idc("ARGV[1]")
+        skip_analysis = False
+    else:
+        export_dir = idc.eval_idc("ARGV[1]")
+        skip_analysis = (idc.eval_idc("ARGV[2]") == "1")
 
     # 批处理模式不询问用户
     do_export(export_dir, ask_user=False, skip_auto_analysis=skip_analysis)
 
-    # 脚本执行完成后自动退出IDA
-    print("[*] Script execution completed, exiting IDA...")
-    idc.qexit(0)
-
-
-# ============================================================================
-# Pointer Export Extension v2 (target type tagging, additive only)
-# ============================================================================
-
-def _ptr_export_v2_safe_text(value):
-    """将字符串/字节安全转成单行文本"""
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        for enc in ('utf-8', 'utf-16-le', 'utf-16-be', 'latin-1'):
-            try:
-                value = value.decode(enc, errors='replace')
-                break
-            except Exception:
-                continue
-        else:
-            value = repr(value)
-    else:
-        value = str(value)
-
-    value = value.replace('\r', ' ').replace('\n', ' ').replace('|', '/').strip()
-    if len(value) > 80:
-        value = value[:77] + '...'
-    return value
-
-
-def _ptr_export_v2_try_get_string_preview(target_ea):
-    """尝试提取字符串内容预览"""
-    try:
-        flags = ida_bytes.get_full_flags(target_ea)
-        if not ida_bytes.is_strlit(flags):
-            return ""
-    except Exception:
-        return ""
-
-    try:
-        strtype = idc.get_str_type(target_ea)
-    except Exception:
-        strtype = -1
-
-    try:
-        raw = ida_bytes.get_strlit_contents(target_ea, -1, strtype)
-    except Exception:
-        raw = None
-
-    preview = _ptr_export_v2_safe_text(raw)
-    if preview:
-        return '"{}"'.format(preview)
-    return "string_literal"
-
-
-def _ptr_export_v2_is_import_target(target_ea, target_name=None):
-    """启发式判断是否为导入项/IAT项"""
-    if target_name is None:
-        target_name = _ptr_export_get_target_name(target_ea)
-
-    seg_name = _ptr_export_get_segment_name(target_ea).lower()
-    name_l = (target_name or "").lower()
-
-    if name_l.startswith('__imp_') or name_l.startswith('imp_'):
-        return True
-
-    import_like_segments = {
-        'extern', '.idata', 'idata', '.idata$2', '.idata$4', '.idata$5', '.idata$6',
-        '.got', 'got', '.got.plt', 'got.plt', '__la_symbol_ptr', '__nl_symbol_ptr'
-    }
-    if seg_name in import_like_segments:
-        return True
-
-    return False
-
-
-def _ptr_export_v2_classify_target(target_ea):
-    """返回 (target_type, target_detail)"""
-    target_name = _ptr_export_get_target_name(target_ea)
-    try:
-        flags = ida_bytes.get_full_flags(target_ea)
-    except Exception:
-        flags = 0
-
-    if _ptr_export_v2_is_import_target(target_ea, target_name):
-        return 'import_pointer', 'import_entry'
-
-    try:
-        if ida_bytes.is_strlit(flags):
-            return 'string_pointer', _ptr_export_v2_try_get_string_preview(target_ea)
-    except Exception:
-        pass
-
-    try:
-        func = ida_funcs.get_func(target_ea)
-    except Exception:
-        func = None
-
-    if func is not None:
-        try:
-            if func.start_ea == target_ea:
-                return 'function_pointer', 'function_start'
-            return 'code_pointer', 'inside_{}'.format(_ptr_export_get_target_name(func.start_ea))
-        except Exception:
-            return 'code_pointer', 'function_body'
-
-    try:
-        if ida_bytes.is_code(flags):
-            return 'code_pointer', 'instruction'
-    except Exception:
-        pass
-
-    try:
-        if ida_bytes.is_struct(flags):
-            return 'struct_pointer', 'struct_data'
-    except Exception:
-        pass
-
-    try:
-        if ida_bytes.is_data(flags):
-            item_size = ida_bytes.get_item_size(target_ea)
-            return 'data_pointer', 'data_item_size={}'.format(item_size)
-    except Exception:
-        pass
-
-    return 'unknown_pointer', ''
-
-
-def _ptr_export_v2_add_record(records, seen, source_ea, target_ea):
-    """添加带类型信息的导出记录"""
-    key = (source_ea, target_ea)
-    if key in seen:
-        return
-    seen.add(key)
-
-    target_name = _ptr_export_get_target_name(target_ea)
-    target_type, target_detail = _ptr_export_v2_classify_target(target_ea)
-    records.append((
-        source_ea,
-        _ptr_export_get_segment_name(source_ea),
-        target_ea,
-        target_name,
-        target_type,
-        target_detail,
-    ))
-
-
-def _ptr_export_v2_collect_from_all_drefs(records, seen):
-    """从所有代码/数据头部的 data xref 收集引用"""
-    total = 0
-    for seg_idx in range(ida_segment.get_segm_qty()):
-        seg = ida_segment.getnseg(seg_idx)
-        if seg is None:
-            continue
-
-        for head in idautils.Heads(seg.start_ea, seg.end_ea):
-            try:
-                flags = ida_bytes.get_full_flags(head)
-            except Exception:
-                continue
-
-            if not ida_bytes.is_head(flags):
-                continue
-            if not (ida_bytes.is_code(flags) or ida_bytes.is_data(flags)):
-                continue
-
-            try:
-                target = ida_xref.get_first_dref_from(head)
-            except Exception:
-                target = ida_idaapi.BADADDR
-
-            while target != ida_idaapi.BADADDR:
-                if _ptr_export_is_valid_target(target):
-                    _ptr_export_v2_add_record(records, seen, head, target)
-                    total += 1
-                try:
-                    target = ida_xref.get_next_dref_from(head, target)
-                except Exception:
-                    break
-
-    return total
-
-
-def _ptr_export_v2_collect_by_raw_scan(records, seen, ptr_size):
-    """扫描已定义数据项，补齐未建立 xref 的裸指针槽位"""
-    total = 0
-    for seg_idx in range(ida_segment.get_segm_qty()):
-        seg = ida_segment.getnseg(seg_idx)
-        if seg is None:
-            continue
-
-        for head in idautils.Heads(seg.start_ea, seg.end_ea):
-            try:
-                flags = ida_bytes.get_full_flags(head)
-            except Exception:
-                continue
-
-            if not ida_bytes.is_head(flags):
-                continue
-            if not ida_bytes.is_data(flags):
-                continue
-
-            try:
-                item_size = ida_bytes.get_item_size(head)
-            except Exception:
-                item_size = 0
-
-            if item_size < ptr_size:
-                continue
-
-            full_slots = item_size // ptr_size
-            if full_slots <= 0:
-                continue
-
-            for slot_index in range(full_slots):
-                slot_ea = head + slot_index * ptr_size
-                try:
-                    target = _ptr_export_read_pointer(slot_ea, ptr_size)
-                except Exception:
-                    continue
-
-                if _ptr_export_is_valid_target(target):
-                    _ptr_export_v2_add_record(records, seen, slot_ea, target)
-                    total += 1
-
-    return total
-
-
-# 追加覆盖：同名函数在插件运行时会使用这里的新版本
-
-def export_pointers(export_dir):
-    """导出所有指针引用到 pointers.txt，并标注目标类型"""
-    pointers_path = os.path.join(export_dir, 'pointers.txt')
-    ptr_size = _ptr_export_get_ptr_size()
-    records = []
-    seen = set()
-
-    dref_hits = _ptr_export_v2_collect_from_all_drefs(records, seen)
-    raw_hits = _ptr_export_v2_collect_by_raw_scan(records, seen, ptr_size)
-
-    records.sort(key=lambda item: (item[0], item[2], item[1], item[3], item[4], item[5]))
-
-    with open(pointers_path, 'w', encoding='utf-8') as f:
-        f.write('# Pointers exported from IDA\n')
-        f.write('# Format: Source_Address | Segment | Points_To_Address | Target_Name | Target_Type | Target_Detail\n')
-        f.write('# Pointer size: {}\n'.format(ptr_size))
-        f.write('#' + '=' * 120 + '\n\n')
-        for source_ea, seg_name, target_ea, target_name, target_type, target_detail in records:
-            f.write('{} | {} | {} | {} | {} | {}\n'.format(
-                hex(source_ea),
-                seg_name,
-                hex(target_ea),
-                target_name,
-                target_type,
-                target_detail,
-            ))
-
-    print('[*] Pointers Summary:')
-    print('    Pointer size: {}'.format(ptr_size))
-    print('    All data-ref hits (code + data): {}'.format(dref_hits))
-    print('    Raw scan hits: {}'.format(raw_hits))
-    print('    Unique pointer references exported: {}'.format(len(records)))
+    # 只在批处理模式下退出
+    if argc >= 2:
+        idc.qexit(0)
