@@ -1,5 +1,5 @@
 # ida_export_for_ai.py
-# IDA Plugin to export decompiled functions, strings, memory, imports and exports for AI analysis
+# IDA Plugin to export decompiled functions with disassembly fallback, strings, memory, imports and exports for AI analysis
 
 import os
 import sys
@@ -12,6 +12,7 @@ import ida_bytes
 import ida_entry
 import idautils
 import idc
+import ida_lines
 import ida_auto
 import ida_kernwin
 import ida_idaapi
@@ -116,15 +117,99 @@ def sanitize_filename(name):
     return name
 
 
-def save_progress(export_dir, processed_addrs, failed_funcs, skipped_funcs):
+def get_function_output_filename(func_ea, export_type):
+    """根据导出类型生成函数输出文件名"""
+    if export_type == "disassembly-fallback":
+        return "{:X}.asm".format(func_ea)
+    return "{:X}.c".format(func_ea)
+
+
+def get_function_output_subdir(export_type):
+    """根据导出类型返回函数输出子目录"""
+    if export_type == "disassembly-fallback":
+        return "disassembly"
+    return "decompile"
+
+
+def get_function_output_relative_path(func_ea, export_type):
+    """获取函数导出文件的相对路径"""
+    return "{}/{}".format(
+        get_function_output_subdir(export_type),
+        get_function_output_filename(func_ea, export_type)
+    )
+
+
+def get_function_output_path(export_dir, func_ea, export_type):
+    """获取函数导出文件的绝对路径"""
+    output_dir = os.path.join(export_dir, get_function_output_subdir(export_type))
+    output_filename = get_function_output_filename(func_ea, export_type)
+    return os.path.join(output_dir, output_filename)
+
+
+def find_existing_function_output(export_dir, func_ea):
+    """查找函数已有的导出文件"""
+    for export_type in ("decompile", "disassembly-fallback"):
+        output_filename = get_function_output_relative_path(func_ea, export_type)
+        output_path = get_function_output_path(export_dir, func_ea, export_type)
+        if os.path.exists(output_path):
+            return output_filename, output_path
+    return None, None
+
+
+def build_function_output_lines(func_ea, func_name, source_type, callers, callees, body, fallback_reason=None):
+    """构建函数导出文件内容"""
+    output_lines = []
+    output_lines.append("/*")
+    output_lines.append(" * func-name: {}".format(func_name))
+    output_lines.append(" * func-address: {}".format(hex(func_ea)))
+    output_lines.append(" * export-type: {}".format(source_type))
+    output_lines.append(" * callers: {}".format(format_address_list(callers) if callers else "none"))
+    output_lines.append(" * callees: {}".format(format_address_list(callees) if callees else "none"))
+    if fallback_reason:
+        output_lines.append(" * fallback-reason: {}".format(fallback_reason))
+    output_lines.append(" */")
+    output_lines.append("")
+    output_lines.append(body)
+    return output_lines
+
+
+def generate_function_disassembly(func_ea):
+    """生成函数的反汇编文本，用于反编译失败时回退"""
+    func = ida_funcs.get_func(func_ea)
+    if not func:
+        return None, "not a valid function"
+
+    disasm_lines = []
+    for item_ea in idautils.FuncItems(func_ea):
+        disasm_line = ida_lines.generate_disasm_line(
+            item_ea,
+            ida_lines.GENDSM_FORCE_CODE | ida_lines.GENDSM_REMOVE_TAGS
+        )
+        if disasm_line is None:
+            disasm_line = ""
+        else:
+            disasm_line = ida_lines.tag_remove(disasm_line).rstrip()
+        if not disasm_line:
+            disasm_line = "<unable to render disassembly>"
+        disasm_lines.append("{:X}: {}".format(item_ea, disasm_line))
+
+    if not disasm_lines:
+        return None, "function has no items"
+
+    return "\n".join(disasm_lines), None
+
+
+def save_progress(export_dir, processed_addrs, fallback_funcs, failed_funcs, skipped_funcs):
     """保存当前进度到文件"""
     progress_file = os.path.join(export_dir, ".export_progress")
     try:
         with open(progress_file, 'w', encoding='utf-8') as f:
             f.write("# Export Progress\n")
-            f.write("# Format: address | status (done/failed/skipped)\n")
+            f.write("# Format: address | status (done/fallback/failed/skipped)\n")
             for addr in processed_addrs:
                 f.write("{:X}|done\n".format(addr))
+            for addr, name, reason, output_filename in fallback_funcs:
+                f.write("{:X}|fallback|{}|{}|{}\n".format(addr, name, reason, output_filename))
             for addr, name, reason in failed_funcs:
                 f.write("{:X}|failed|{}|{}\n".format(addr, name, reason))
             for addr, name, reason in skipped_funcs:
@@ -137,11 +222,12 @@ def load_progress(export_dir):
     """从文件加载进度"""
     progress_file = os.path.join(export_dir, ".export_progress")
     processed = set()
+    fallback = []
     failed = []
     skipped = []
 
     if not os.path.exists(progress_file):
-        return processed, failed, skipped
+        return processed, fallback, failed, skipped
 
     try:
         with open(progress_file, 'r', encoding='utf-8') as f:
@@ -155,6 +241,8 @@ def load_progress(export_dir):
                     status = parts[1]
                     if status == 'done':
                         processed.add(addr)
+                    elif status == 'fallback' and len(parts) >= 5:
+                        fallback.append((addr, parts[2], parts[3], parts[4]))
                     elif status == 'failed' and len(parts) >= 4:
                         failed.append((addr, parts[2], parts[3]))
                     elif status == 'skipped' and len(parts) >= 4:
@@ -163,7 +251,7 @@ def load_progress(export_dir):
     except Exception as e:
         print("[!] Failed to load progress: {}".format(str(e)))
 
-    return processed, failed, skipped
+    return processed, fallback, failed, skipped
 
 
 def export_decompiled_functions(export_dir, skip_existing=True):
@@ -174,10 +262,13 @@ def export_decompiled_functions(export_dir, skip_existing=True):
         skip_existing: 是否跳过已存在的文件
     """
     decompile_dir = os.path.join(export_dir, "decompile")
+    disassembly_dir = os.path.join(export_dir, "disassembly")
     ensure_dir(decompile_dir)
+    ensure_dir(disassembly_dir)
 
     total_funcs = 0
     exported_funcs = 0
+    fallback_funcs = []
     failed_funcs = []
     skipped_funcs = []
     function_index = []
@@ -187,7 +278,8 @@ def export_decompiled_functions(export_dir, skip_existing=True):
     io_executor = ThreadPoolExecutor(max_workers=1)
 
     # 加载之前的进度
-    processed_addrs, prev_failed, prev_skipped = load_progress(export_dir)
+    processed_addrs, prev_fallback, prev_failed, prev_skipped = load_progress(export_dir)
+    fallback_funcs.extend(prev_fallback)
     failed_funcs.extend(prev_failed)
     skipped_funcs.extend(prev_skipped)
 
@@ -213,27 +305,26 @@ def export_decompiled_functions(export_dir, skip_existing=True):
 
     def write_function_file(args):
         """线程安全的文件写入"""
-        func_ea, func_name, dec_str, callers, callees = args
+        func_ea, func_name, body, callers, callees, export_type, fallback_reason = args
+        output_lines = build_function_output_lines(
+            func_ea,
+            func_name,
+            export_type,
+            callers,
+            callees,
+            body,
+            fallback_reason=fallback_reason
+        )
 
-        output_lines = []
-        output_lines.append("/*")
-        output_lines.append(" * func-name: {}".format(func_name))
-        output_lines.append(" * func-address: {}".format(hex(func_ea)))
-        output_lines.append(" * callers: {}".format(format_address_list(callers) if callers else "none"))
-        output_lines.append(" * callees: {}".format(format_address_list(callees) if callees else "none"))
-        output_lines.append(" */")
-        output_lines.append("")
-        output_lines.append(dec_str)
-
-        output_filename = "{:X}.c".format(func_ea)
-        output_path = os.path.join(decompile_dir, output_filename)
+        output_filename = get_function_output_relative_path(func_ea, export_type)
+        output_path = get_function_output_path(export_dir, func_ea, export_type)
 
         try:
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(output_lines))
-            return func_ea, func_name, True, output_filename, callers, callees, None
+            return func_ea, func_name, True, output_filename, callers, callees, export_type, fallback_reason, None
         except IOError as e:
-            return func_ea, func_name, False, output_filename, callers, callees, str(e)
+            return func_ea, func_name, False, output_filename, callers, callees, export_type, fallback_reason, str(e)
 
     def aggressive_memory_cleanup():
         """激进的内存清理"""
@@ -266,63 +357,84 @@ def export_decompiled_functions(export_dir, skip_existing=True):
 
         dec_str = None
         dec_obj = None
+        output_body = None
+        export_type = None
+        fallback_reason = None
 
         try:
             # 尝试反编译
             dec_obj = ida_hexrays.decompile(func_ea)
             if dec_obj is None:
-                failed_funcs.append((func_ea, func_name, "decompile returned None"))
-                processed_addrs.add(func_ea)
-                continue
+                fallback_reason = "decompile returned None"
+            else:
+                dec_str = str(dec_obj)
+                # 立即释放反编译对象
+                dec_obj = None
 
-            dec_str = str(dec_obj)
-            # 立即释放反编译对象
-            dec_obj = None
-
-            if not dec_str or len(dec_str.strip()) == 0:
-                failed_funcs.append((func_ea, func_name, "empty decompilation result"))
-                processed_addrs.add(func_ea)
-                continue
-
-            # 只在需要时获取调用关系
-            callers = get_callers(func_ea)
-            callees = get_callees(func_ea)
-
-            output_filename = "{:X}.c".format(func_ea)
-            output_path = os.path.join(decompile_dir, output_filename)
-
-            # 如果文件已存在且skip_existing为True，则跳过
-            if skip_existing and os.path.exists(output_path):
-                exported_funcs += 1
-                processed_addrs.add(func_ea)
-                # 立即释放dec_str
-                dec_str = None
-                if (exported_funcs + len(prev_failed) + len(prev_skipped)) % 100 == 0:
-                    print("[+] Exported {} / {} functions...".format(
-                        exported_funcs + len(prev_failed) + len(prev_skipped), total_funcs))
-                continue
-
-            # 提交写入任务
-            write_args = (func_ea, func_name, dec_str, callers, callees)
-            future = io_executor.submit(write_function_file, write_args)
-            pending_writes.append((future, func_ea, func_name, output_filename, callers, callees))
-
-            # 立即释放dec_str，因为已经传递给写入任务
-            dec_str = None
+                if dec_str and len(dec_str.strip()) > 0:
+                    output_body = dec_str
+                    export_type = "decompile"
+                else:
+                    fallback_reason = "empty decompilation result"
 
         except ida_hexrays.DecompilationFailure as e:
-            failed_funcs.append((func_ea, func_name, "decompilation failure: {}".format(str(e))))
-            processed_addrs.add(func_ea)
-            continue
+            fallback_reason = "decompilation failure: {}".format(str(e))
         except Exception as e:
-            failed_funcs.append((func_ea, func_name, "unexpected error: {}".format(str(e))))
+            fallback_reason = "unexpected error: {}".format(str(e))
             print("[!] Error decompiling {} at {}: {}".format(func_name, hex(func_ea), str(e)))
-            processed_addrs.add(func_ea)
-            continue
         finally:
             # 确保反编译对象被释放
             dec_obj = None
             dec_str = None
+
+        if output_body is None:
+            output_body, disasm_error = generate_function_disassembly(func_ea)
+            if output_body is None:
+                combined_reason = fallback_reason or "unknown decompilation error"
+                if disasm_error:
+                    combined_reason = "{}; disassembly fallback failed: {}".format(combined_reason, disasm_error)
+                failed_funcs.append((func_ea, func_name, combined_reason))
+                processed_addrs.add(func_ea)
+                continue
+            export_type = "disassembly-fallback"
+
+        callers = get_callers(func_ea)
+        callees = get_callees(func_ea)
+
+        existing_output_filename, _ = find_existing_function_output(export_dir, func_ea)
+        if skip_existing and existing_output_filename:
+            exported_funcs += 1
+            processed_addrs.add(func_ea)
+            if (exported_funcs + len(prev_fallback) + len(prev_failed) + len(prev_skipped)) % 100 == 0:
+                print("[+] Exported {} / {} functions...".format(
+                    exported_funcs + len(prev_fallback) + len(prev_failed) + len(prev_skipped),
+                    total_funcs
+                ))
+            continue
+
+        output_filename = get_function_output_relative_path(func_ea, export_type)
+        write_args = (
+            func_ea,
+            func_name,
+            output_body,
+            callers,
+            callees,
+            export_type,
+            fallback_reason
+        )
+        future = io_executor.submit(write_function_file, write_args)
+        pending_writes.append((
+            future,
+            func_ea,
+            func_name,
+            output_filename,
+            callers,
+            callees,
+            export_type,
+            fallback_reason
+        ))
+
+        output_body = None
 
         # 定期清理撤销缓冲区
         if (idx + 1) % MEMORY_CLEAN_INTERVAL == 0:
@@ -331,21 +443,26 @@ def export_decompiled_functions(export_dir, skip_existing=True):
 
         # 批量等待写入完成并收集结果
         if len(pending_writes) >= BATCH_SIZE:
-            for future, func_ea, func_name, output_filename, callers, callees in pending_writes:
+            for future, func_ea, func_name, output_filename, callers, callees, export_type, fallback_reason in pending_writes:
                 try:
                     result = future.result()
-                    func_ea, func_name, success, output_filename, callers, callees, error = result
+                    func_ea, func_name, success, output_filename, callers, callees, export_type, fallback_reason, error = result
 
                     if success:
                         func_info = {
                             'address': func_ea,
                             'name': func_name,
                             'filename': output_filename,
+                            'export_type': export_type,
                             'callers': callers,
                             'callees': callees
                         }
+                        if fallback_reason:
+                            func_info['fallback_reason'] = fallback_reason
                         function_index.append(func_info)
                         addr_to_info[func_ea] = func_info
+                        if export_type == "disassembly-fallback":
+                            fallback_funcs.append((func_ea, func_name, fallback_reason or "decompilation failed", output_filename))
                         exported_funcs += 1
                         processed_addrs.add(func_ea)
                     else:
@@ -356,37 +473,38 @@ def export_decompiled_functions(export_dir, skip_existing=True):
                     print("[!] Write error: {}".format(str(e)))
 
             # 保存进度并清理
-            save_progress(export_dir, processed_addrs, failed_funcs, skipped_funcs)
+            save_progress(export_dir, processed_addrs, fallback_funcs, failed_funcs, skipped_funcs)
             if exported_funcs % 100 == 0:
-                print("[+] Exported {} / {} functions...".format(exported_funcs + len(prev_failed) + len(prev_skipped),
-                                                                 total_funcs))
-
-            # 清理索引，避免内存无限增长
-            if len(function_index) > 1000:
-                # 保存到临时文件后清空
-                function_index = []
-                addr_to_info = {}
+                print("[+] Exported {} / {} functions...".format(
+                    exported_funcs + len(prev_fallback) + len(prev_failed) + len(prev_skipped),
+                    total_funcs
+                ))
 
             pending_writes = []
             aggressive_memory_cleanup()
 
     # 处理剩余的写入任务
     if pending_writes:
-        for future, func_ea, func_name, output_filename, callers, callees in pending_writes:
+        for future, func_ea, func_name, output_filename, callers, callees, export_type, fallback_reason in pending_writes:
             try:
                 result = future.result()
-                func_ea, func_name, success, output_filename, callers, callees, error = result
+                func_ea, func_name, success, output_filename, callers, callees, export_type, fallback_reason, error = result
 
                 if success:
                     func_info = {
                         'address': func_ea,
                         'name': func_name,
                         'filename': output_filename,
+                        'export_type': export_type,
                         'callers': callers,
                         'callees': callees
                     }
+                    if fallback_reason:
+                        func_info['fallback_reason'] = fallback_reason
                     function_index.append(func_info)
                     addr_to_info[func_ea] = func_info
+                    if export_type == "disassembly-fallback":
+                        fallback_funcs.append((func_ea, func_name, fallback_reason or "decompilation failed", output_filename))
                     exported_funcs += 1
                     processed_addrs.add(func_ea)
                 else:
@@ -400,13 +518,24 @@ def export_decompiled_functions(export_dir, skip_existing=True):
     io_executor.shutdown(wait=True)
 
     # 最终保存进度
-    save_progress(export_dir, processed_addrs, failed_funcs, skipped_funcs)
+    save_progress(export_dir, processed_addrs, fallback_funcs, failed_funcs, skipped_funcs)
 
     print("\n[*] Decompilation Summary:")
     print("    Total functions: {}".format(total_funcs))
     print("    Exported: {}".format(exported_funcs))
+    print("    Fallback to disassembly: {}".format(len(fallback_funcs)))
     print("    Skipped: {} (library/invalid functions)".format(len(skipped_funcs)))
     print("    Failed: {}".format(len(failed_funcs)))
+
+    if fallback_funcs:
+        fallback_log_path = os.path.join(export_dir, "disassembly_fallback.txt")
+        with open(fallback_log_path, 'w', encoding='utf-8') as f:
+            f.write("# Fallback to disassembly for {} functions\n".format(len(fallback_funcs)))
+            f.write("# Format: address | function_name | reason | output_file\n")
+            f.write("#" + "=" * 80 + "\n\n")
+            for addr, name, reason, output_filename in fallback_funcs:
+                f.write("{} | {} | {} | {}\n".format(hex(addr), name, reason, output_filename))
+        print("    Fallback list saved to: disassembly_fallback.txt")
 
     # 保存失败列表
     if failed_funcs:
@@ -443,6 +572,9 @@ def export_decompiled_functions(export_dir, skip_existing=True):
                 f.write("Function: {}\n".format(func_info['name']))
                 f.write("Address: {}\n".format(hex(func_info['address'])))
                 f.write("File: {}\n".format(func_info['filename']))
+                f.write("Type: {}\n".format(func_info['export_type']))
+                if 'fallback_reason' in func_info:
+                    f.write("Fallback reason: {}\n".format(func_info['fallback_reason']))
                 f.write("\n")
 
                 if func_info['callers']:
@@ -1085,7 +1217,7 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
 
 
     if has_hexrays:
-        print("[*] Exporting decompiled functions...")
+        print("[*] Exporting decompiled functions with disassembly fallback...")
         print("[*] Tip: If IDA crashes, you can restart and the export will resume from where it left off")
         export_decompiled_functions(export_dir, skip_existing=True)
 
@@ -1110,7 +1242,7 @@ class ExportForAIPlugin(ida_idaapi.plugin_t):
 
     flags = ida_idaapi.PLUGIN_KEEP
     comment = "Export IDA data for AI analysis"
-    help = "Export decompiled functions, strings, memory, imports and exports"
+    help = "Export decompiled functions with disassembly fallback, strings, memory, imports and exports"
     wanted_name = "Export for AI"
     wanted_hotkey = "Ctrl-Shift-E"
 

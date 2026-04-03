@@ -33,8 +33,10 @@ After restarting IDA:
 
 | File/Directory          | Content                    | Description                                                                                 |
 | ----------------------- | -------------------------- | ------------------------------------------------------------------------------------------- |
-| `decompile/`            | Decompiled C code          | Each function as a `.c` file, includes function name, address, callers, callees            |
-| `decompile_failed.txt`  | Failed decompilation list  | Records functions that failed to decompile with reasons                                     |
+| `decompile/`            | Decompiled C code          | Each successfully decompiled function as a `.c` file, with function name, address, callers, callees |
+| `disassembly/`          | Disassembly fallback code  | Falls back to disassembly when decompilation fails, one `.asm` file per function with the same metadata |
+| `disassembly_fallback.txt` | Disassembly fallback list | Records fallback functions, fallback reasons, and output file paths                         |
+| `decompile_failed.txt`  | Hard failure list          | Records functions where both decompilation and disassembly fallback failed                  |
 | `decompile_skipped.txt` | Skipped functions list     | Records skipped library functions and invalid functions                                     |
 | `strings.txt`           | String table               | Includes address, length, type (ASCII/UTF-16/UTF-32), content                               |
 | `imports.txt`           | Import table               | Format: `address:function_name`                                                             |
@@ -45,12 +47,13 @@ After restarting IDA:
 
 ### Decompiled Function Export
 
-Each function is exported as a separate `.c` file with metadata header:
+Each function is exported as a separate `.c` file when decompilation succeeds. If decompilation fails, the function is exported to `disassembly/` as a `.asm` file instead. Both outputs keep the same metadata header:
 
 ```c
 /*
  * func-name: sub_401000
  * func-address: 0x401000
+ * export-type: decompile
  * callers: 0x402000, 0x403000
  * callees: 0x404000, 0x405000
  */
@@ -61,8 +64,9 @@ Each function is exported as a separate `.c` file with metadata header:
 **Smart Handling**:
 
 - Automatically skips library functions and invalid functions
+- Automatically falls back to disassembly export when decompilation fails
 - Handles special characters and duplicate function names (adds address suffix)
-- Generates detailed failure and skip logs
+- Generates detailed fallback, failure, and skip logs
 - Shows export progress (every 100 functions)
 
 ### Call Relationship Analysis
@@ -84,6 +88,7 @@ Displays detailed statistics after export:
 
 - Total number of functions
 - Successfully exported count
+- Disassembly fallback count
 - Skipped count (library/invalid functions)
 - Failed count (with failure reasons)
 - Memory export size and file count
